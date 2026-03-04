@@ -1,12 +1,13 @@
 import {
   generateText,
-  ImagePart,
+  type ImagePart,
   LanguageModelUsage,
   ModelMessage,
   stepCountIs,
   streamText,
   ToolSet,
   UserModelMessage,
+  type PrepareStepFunction,
 } from 'ai'
 import {
   AgentInput,
@@ -36,6 +37,7 @@ import { buildIdentityHeaders } from './utils/headers'
 import { createFS } from './utils'
 import { createTextLoopGuard, createTextLoopProbeBuffer } from './sential'
 import { createToolLoopGuardedTools } from './tool-loop'
+import { createPrepareStepWithReadMedia } from './utils/read-media-injector'
 
 const ANTHROPIC_BUDGET: Record<string, number> = { low: 5000, medium: 16000, high: 50000 }
 const GOOGLE_BUDGET: Record<string, number> = { low: 5000, medium: 16000, high: 50000 }
@@ -84,7 +86,7 @@ export const buildNativeImageParts = (attachments: GatewayInputAttachment[]): Im
       (attachment.transport === 'inline_data_url' || attachment.transport === 'public_url') &&
       Boolean(attachment.payload),
     )
-    .map((attachment) => ({ type: 'image', image: attachment.payload } as ImagePart))
+    .map((attachment): ImagePart => ({ type: 'image', image: attachment.payload }))
 }
 
 export const createAgent = (
@@ -110,6 +112,7 @@ export const createAgent = (
   fetch: AuthFetcher,
 ) => {
   const model = createModel(modelConfig)
+  const supportsImageInput = hasInputModality(modelConfig, ModelInput.Image)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const providerOptions = buildProviderOptions(modelConfig) as any
   const loopDetectionEnabled = loopDetection?.enabled === true
@@ -161,6 +164,7 @@ export const createAgent = (
       skills,
       enabledSkills,
       inbox,
+      supportsImageInput,
       files,
     })
   }
@@ -205,8 +209,7 @@ export const createAgent = (
   }
 
   const generateUserPrompt = (input: AgentInput) => {
-    const supportsImage = hasInputModality(modelConfig, ModelInput.Image)
-    const imageParts = supportsImage ? buildNativeImageParts(input.attachments) : []
+    const imageParts = supportsImageInput ? buildNativeImageParts(input.attachments) : []
 
     const userMessage: UserModelMessage = {
       role: 'user',
@@ -250,13 +253,20 @@ export const createAgent = (
   const runTextGeneration = async ({
     messages,
     systemPrompt,
-    prepareStep,
+    basePrepareStep,
   }: {
     messages: ModelMessage[]
     systemPrompt: string
-    prepareStep?: () => { system: string }
+    basePrepareStep?: PrepareStepFunction
   }) => {
-    const { tools, close } = await getAgentTools()
+    const { tools: baseTools, close } = await getAgentTools()
+    const { prepareStep, tools: readMediaTools } = createPrepareStepWithReadMedia({
+      modelConfig,
+      fs,
+      systemPrompt,
+      basePrepareStep,
+    })
+    const tools = { ...baseTools, ...readMediaTools }
     let shouldAbortForToolLoop = false
     const guardedTools = buildGuardedTools(tools, () => {
       shouldAbortForToolLoop = true
@@ -270,7 +280,7 @@ export const createAgent = (
         system: systemPrompt,
         ...(providerOptions && { providerOptions }),
         stopWhen: stepCountIs(Infinity),
-        ...(prepareStep && { prepareStep }),
+        prepareStep,
         ...(loopDetectionEnabled && {
           onStepFinish: ({ text }: { text: string }) => {
             if (shouldAbortForToolLoop) {
@@ -306,11 +316,7 @@ export const createAgent = (
     const { response, reasoning, text, usage, steps } = await runTextGeneration({
       messages,
       systemPrompt,
-      prepareStep: () => {
-        return {
-          system: systemPrompt,
-        }
-      },
+      basePrepareStep: () => ({ system: systemPrompt }),
     })
     const stepUsages = buildStepUsages(steps)
     const { cleanedText, attachments: textAttachments } =
@@ -352,15 +358,12 @@ export const createAgent = (
         description: params.description,
       })
     }
+    const systemPrompt = generateSubagentSystemPrompt()
     const messages = [...params.messages, userPrompt]
     const { response, reasoning, text, usage, steps } = await runTextGeneration({
       messages,
-      systemPrompt: generateSubagentSystemPrompt(),
-      prepareStep: () => {
-        return {
-          system: generateSubagentSystemPrompt(),
-        }
-      },
+      systemPrompt,
+      basePrepareStep: () => ({ system: generateSubagentSystemPrompt() }),
     })
     const stepUsages = buildStepUsages(steps)
     return {
@@ -497,7 +500,14 @@ export const createAgent = (
       usages: [],
     }
     const toolLoopAbortCallIds = new Set<string>()
-    const { tools, close } = await getAgentTools()
+    const { tools: baseTools, close } = await getAgentTools()
+    const { prepareStep, tools: readMediaTools } = createPrepareStepWithReadMedia({
+      modelConfig,
+      fs,
+      systemPrompt,
+      basePrepareStep: () => ({ system: systemPrompt }),
+    })
+    const tools = { ...baseTools, ...readMediaTools }
     // Stream path needs deferred abort to keep tool_call_start/tool_call_end event pairing.
     const guardedTools = buildGuardedTools(tools, (toolCallId) => {
       toolLoopAbortCallIds.add(toolCallId)
@@ -517,11 +527,7 @@ export const createAgent = (
         system: systemPrompt,
         ...(providerOptions && { providerOptions }),
         stopWhen: stepCountIs(Infinity),
-        prepareStep: () => {
-          return {
-            system: systemPrompt,
-          }
-        },
+        prepareStep,
         tools: guardedTools,
         onFinish: async ({ usage, reasoning, response, steps }) => {
           await closeTools()

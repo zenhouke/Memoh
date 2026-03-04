@@ -14,6 +14,7 @@ export interface SystemParams {
   files: SystemFile[]
   attachments?: string[]
   inbox?: InboxItem[]
+  supportsImageInput?: boolean
 }
 
 export const skillPrompt = (skill: AgentSkill) => {
@@ -65,6 +66,7 @@ export const system = ({
   enabledSkills,
   files,
   inbox = [],
+  supportsImageInput = true,
 }: SystemParams) => {
   const home = '/data'
   // ── Static section (stable prefix for LLM prompt caching) ──────────
@@ -80,6 +82,16 @@ export const system = ({
     'time-now': date.toISOString(),
   }
 
+  const basicTools = [
+    `- ${quote('read')}: read file content`,
+    supportsImageInput ? `- ${quote('read_media')}: view the media` : null,
+    `- ${quote('write')}: write file content`,
+    `- ${quote('list')}: list directory entries`,
+    `- ${quote('edit')}: replace exact text in a file`,
+    `- ${quote('exec')}: execute command`,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n')
   console.log('inbox', inbox)
 
   return `
@@ -93,11 +105,7 @@ You are just woke up.
 ${quote(home)} is your HOME — you can read and write files there freely.
 
 ## Basic Tools
-- ${quote('read')}: read file content
-- ${quote('write')}: write file content
-- ${quote('list')}: list directory entries
-- ${quote('edit')}: replace exact text in a file
-- ${quote('exec')}: execute command
+${basicTools}
 
 ## Safety
 - Keep private data private
